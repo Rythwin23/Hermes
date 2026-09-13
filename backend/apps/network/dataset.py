@@ -1,0 +1,66 @@
+from __future__ import annotations
+
+from threading import Lock
+
+import polars as pl
+from django.db import connection
+
+
+class GTFSDataStore:
+    _instance: GTFSDataStore | None = None
+    _lock = Lock()
+
+    def __init__(self) -> None:
+        self.stops = self._load_table(
+            """
+            SELECT stop_id, stop_name, stop_lat, stop_lon,
+                   location_type, parent_stop_id
+            FROM gtfs_stops
+            """
+        )
+        self.routes = self._load_table(
+            """
+            SELECT route_id, route_short_name, route_long_name,
+                   route_type, route_type_name, route_color
+            FROM gtfs_routes
+            """
+        )
+        self.trips = self._load_table(
+            """
+            SELECT trip_id, route_id, service_id, trip_headsign,
+                   trip_short_name, direction_id
+            FROM gtfs_trips
+            """
+        )
+        self.stop_times = self._load_table(
+            "SELECT trip_id, stop_id FROM gtfs_stop_times"
+        )
+
+    @staticmethod
+    def _load_table(query: str) -> pl.DataFrame:
+        with connection.cursor() as cursor:
+            cursor.execute(query)
+            columns = [column[0] for column in cursor.description]
+            rows = cursor.fetchall()
+
+        return pl.DataFrame(rows, schema=columns, orient="row")
+
+    @classmethod
+    def get(cls) -> GTFSDataStore:
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+
+    @classmethod
+    def reload(cls) -> GTFSDataStore:
+        new_store = cls()
+        with cls._lock:
+            cls._instance = new_store
+        return new_store
+
+
+def reload_gtfs_data() -> None:
+    """Reload the in-memory GTFS snapshot after a successful ingestion."""
+    GTFSDataStore.reload()

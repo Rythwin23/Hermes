@@ -1,3 +1,5 @@
+__pycache__
 .venv
-ressources/
-documentations/
+ressources
+*.pdf
+.env

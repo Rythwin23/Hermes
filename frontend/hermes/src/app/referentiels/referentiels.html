@@ -1,0 +1,85 @@
+<section class="page-header">
+  <div>
+    <span class="eyebrow">Données du système</span>
+    <h2>Référentiels</h2>
+  </div>
+</section>
+
+<section class="referential-panel">
+  <aside class="sidebar">
+    <h3>Tables</h3>
+    <button
+      *ngFor="let table of tables"
+      type="button"
+      class="table-button"
+      [class.active]="selectedTable === table.key"
+      (click)="setTable(table.key)">
+      {{ table.label }}
+    </button>
+  </aside>
+
+  <div class="grid-panel">
+    <div class="table-header">
+      <h3>{{ selectedTableLabel }}</h3>
+      <span *ngIf="isLoading">Chargement...</span>
+      <span *ngIf="!isLoading && !errorMessage">{{
+        totalRowsByTable[selectedTable] }} lignes</span>
+    </div>
+
+    <p class="error-message" *ngIf="errorMessage">{{ errorMessage }}</p>
+
+    <div class="grid-wrapper">
+      <ag-grid-angular
+        [theme]="myTheme"
+        [modules]="modules"
+        [rowData]="rowData"
+        [columnDefs]="columnDefs"
+        [defaultColDef]="defaultColDef"
+        [getRowStyle]="getRowStyle"
+        (gridReady)="onGridReady($event)"
+        (rowClicked)="onRowClicked($event)"
+        style="width: 100%; height: 22em">
+      </ag-grid-angular>
+
+      <div class="loading-overlay" *ngIf="isLoading">Chargement...</div>
+    </div>
+
+    <div class="details-panel" *ngIf="selectedStop || selectedRoute">
+      <ng-container *ngIf="selectedStop">
+        <h4>{{ selectedStop['stop_name'] }}</h4>
+        <p><strong>ID :</strong> {{ selectedStop['stop_id'] }}</p>
+
+        <div class="detail-section" *ngIf="stopChildren.length">
+          <h5>Stop children</h5>
+          <ul>
+            <li *ngFor="let child of stopChildren">
+              {{ child['child_stop_name'] }} ({{ child['child_stop_id'] }})
+            </li>
+          </ul>
+        </div>
+
+        <div class="detail-section" *ngIf="stopRoutes.length">
+          <h5>Routes desservies</h5>
+          <ul>
+            <li *ngFor="let route of stopRoutes">
+              {{ route['route_type_name'] }} {{ route['route_long_name'] }}
+            </li>
+          </ul>
+        </div>
+      </ng-container>
+
+      <ng-container *ngIf="selectedRoute">
+        <h4>{{ selectedRoute['route_long_name'] }}</h4>
+        <p><strong>ID :</strong> {{ selectedRoute['route_id'] }}</p>
+
+        <div class="detail-section" *ngIf="routeStops.length">
+          <h5>Arrêts de la ligne</h5>
+          <ul>
+            <li *ngFor="let stop of routeStops">{{ stop['stop_name'] }} ({{
+              stop['stop_id'] }})</li>
+          </ul>
+        </div>
+      </ng-container>
+    </div>
+  </div>
+</section>

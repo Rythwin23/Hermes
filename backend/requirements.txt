@@ -1,0 +1,5 @@
+Django>=6.1
+djangorestframework>=3.18.1
+polars>=1.44.2
+psycopg[binary]>=3.3.5
+ormsgpack>=1.12.2

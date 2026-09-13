@@ -1,0 +1,31 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Backend: Django API",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/backend/manage.py",
+      "args": ["runserver", "0.0.0.0:8000"],
+      "cwd": "${workspaceFolder}/backend",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/backend"
+      },
+      "django": true,
+      "justMyCode": true
+    },
+    {
+      "name": "Frontend: Angular app",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "cd ${workspaceFolder}/frontend/hermes && npm start -- --host 0.0.0.0 --port 4200"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Fullstack",
+      "configurations": ["Backend: Django API", "Frontend: Angular app"],
+      "stopAll": true
+    }
+  ]
+}

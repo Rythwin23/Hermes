@@ -110,9 +110,10 @@ def get_child_stops(parent_stop_id: str) -> dict:
 def get_stop_detail(stop_id: str) -> dict:
     """Return the stop metadata, its child stops and the routes served here."""
     data = GTFSDataStore.get()
-    stop = data.stops.filter(pl.col("stop_id") == stop_id).row(named=True)
-    if stop is None:
+    stop_rows = data.stops.filter(pl.col("stop_id") == stop_id)
+    if stop_rows.is_empty():
         return {"stop": None, "child_stops": [], "routes": []}
+    stop = stop_rows.row(0, named=True)
 
     child_stops = data.stops.filter(pl.col("parent_stop_id") == stop_id)
     if child_stops.is_empty():
@@ -154,9 +155,10 @@ def get_stop_detail(stop_id: str) -> dict:
 def get_route_stops(route_id: str) -> dict:
     """Return all stops served by a route."""
     data = GTFSDataStore.get()
-    route = data.routes.filter(pl.col("route_id") == route_id).row(named=True)
-    if route is None:
+    route = data.routes.filter(pl.col("route_id") == route_id)
+    if route.is_empty():
         return {"route": None, "stops": []}
+    route = route.row(0, named=True)
 
     stops = (
         data.stop_times.lazy()

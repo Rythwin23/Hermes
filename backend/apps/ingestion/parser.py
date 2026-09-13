@@ -240,5 +240,9 @@ def parse_transfers(
             ],
             how="vertical_relaxed",
         )
-        .unique(subset=["from_stop_id", "to_stop_id"])
+        .unique(
+            subset=["from_stop_id", "to_stop_id"],
+            keep="first",
+            maintain_order=True,
+        )
     )

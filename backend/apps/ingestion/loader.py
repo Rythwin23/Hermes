@@ -33,7 +33,7 @@ COPY_CHUNK_SIZE = 50_000
 
 def load_table(
     model: type[Model],
-    df_input: pl.DataFrame | pl.LazyFrame,
+    df_input: pl.LazyFrame,
     exclude_columns: set[str] | None = None,
 ) -> int:
     """
@@ -50,11 +50,7 @@ def load_table(
     Returns:
         Number of rows inserted.
     """
-    data = (
-        df_input.collect()
-        if isinstance(df_input, pl.LazyFrame)
-        else df_input
-    )
+    data = df_input.collect()
 
     excluded = exclude_columns or set()
 
@@ -131,7 +127,7 @@ def _update_stop_geography() -> None:
 
 @contextmanager
 def _without_stop_time_indexes():
-    """Temporarily remove secondary stop-time indexes during bulk loading."""
+    """Temporarily remove and restore secondary stop-time indexes."""
     index_definitions: list[tuple[str, str]] = []
 
     with connection.cursor() as cursor:
@@ -164,16 +160,12 @@ def _without_stop_time_indexes():
                 )
             )
 
-    try:
-        yield
-    finally:
-        transaction.on_commit(
-            lambda: _recreate_indexes(index_definitions)
-        )
+    yield
+    _recreate_indexes(index_definitions)
 
 
 def _recreate_indexes(index_definitions: list[tuple[str, str]]) -> None:
-    """Recreate indexes after the transaction that loaded their table."""
+    """Recreate indexes within the transaction that loaded their table."""
     with connection.cursor() as cursor:
         for _, index_definition in index_definitions:
             cursor.execute(index_definition)
@@ -199,7 +191,7 @@ def load_gtfs(resources_dir: str | None = None) -> dict[str, int]:
             Stop.objects.update(parent_stop=None)
         model.objects.all().delete()
 
-    stops = parse_stops(resources_path).collect()
+    stops = parse_stops(resources_path)
     stops_count = load_stops(stops)
     print(f"Parsed {stops_count} stops")
 

@@ -192,6 +192,10 @@ export class Referentiels implements OnInit {
     return this.tableByKey[this.selectedTable];
   }
 
+  get selectedTableLabel() {
+    return this.tables.find((table) => table.key === this.selectedTable)?.label ?? '';
+  }
+
   setTable(tableKey: string) {
     this.selectedTable = tableKey;
     this.selectedStop = null;
@@ -276,6 +280,8 @@ export class Referentiels implements OnInit {
       this.selectedStop = row;
       this.selectedRoute = null;
       this.routeStops = [];
+      this.stopChildren = [];
+      this.stopRoutes = [];
       this.loadStopDetail(String(stopId));
       return;
     }
@@ -290,6 +296,7 @@ export class Referentiels implements OnInit {
       this.selectedStop = null;
       this.stopChildren = [];
       this.stopRoutes = [];
+      this.routeStops = [];
       this.loadRouteDetail(String(routeId));
     }
   }

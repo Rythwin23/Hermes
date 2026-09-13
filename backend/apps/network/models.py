@@ -37,7 +37,7 @@ class Route(models.Model):
     route_long_name = models.CharField(max_length=255)
     route_type = models.PositiveSmallIntegerField()
     route_type_name = models.CharField(max_length=32, blank=True)
-    route_color = models.CharField(max_length=6, blank=True)
+    route_color = models.CharField(max_length=6, blank=True, default="FFFFFF")
 
     class Meta:
         db_table = "gtfs_routes"

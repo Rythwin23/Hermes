@@ -13,17 +13,17 @@
       type="button"
       class="table-button"
       [class.active]="selectedTable === table.key"
-      (click)="setTable(table.key)"
-    >
+      (click)="setTable(table.key)">
       {{ table.label }}
     </button>
   </aside>
 
   <div class="grid-panel">
     <div class="table-header">
-      <h3>{{ tables.find((table) => table.key === selectedTable)?.label }}</h3>
+      <h3>{{ selectedTableLabel }}</h3>
       <span *ngIf="isLoading">Chargement...</span>
-      <span *ngIf="!isLoading && !errorMessage">{{ totalRowsByTable[selectedTable] }} lignes</span>
+      <span *ngIf="!isLoading && !errorMessage">{{
+        totalRowsByTable[selectedTable] }} lignes</span>
     </div>
 
     <p class="error-message" *ngIf="errorMessage">{{ errorMessage }}</p>
@@ -38,8 +38,7 @@
         [getRowStyle]="getRowStyle"
         (gridReady)="onGridReady($event)"
         (rowClicked)="onRowClicked($event)"
-        style="width: 100%; height: 22em"
-      >
+        style="width: 100%; height: 22em">
       </ag-grid-angular>
 
       <div class="loading-overlay" *ngIf="isLoading">Chargement...</div>
@@ -76,7 +75,8 @@
         <div class="detail-section" *ngIf="routeStops.length">
           <h5>Arrêts de la ligne</h5>
           <ul>
-            <li *ngFor="let stop of routeStops">{{ stop['stop_name'] }} ({{ stop['stop_id'] }})</li>
+            <li *ngFor="let stop of routeStops">{{ stop['stop_name'] }} ({{
+              stop['stop_id'] }})</li>
           </ul>
         </div>
       </ng-container>

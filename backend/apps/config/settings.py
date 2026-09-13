@@ -51,14 +51,10 @@ DATABASES = {
 }
 USE_TZ = True
 TIME_ZONE = "Europe/Paris"
-GDAL_LIBRARY_PATH = os.getenv(
-    "GDAL_LIBRARY_PATH",
-    r"C:\Users\rabah\AppData\Local\Programs\OSGeo4W\bin\gdal313.dll",
-)
-GEOS_LIBRARY_PATH = os.getenv(
-    "GEOS_LIBRARY_PATH",
-    r"C:\Users\rabah\AppData\Local\Programs\OSGeo4W\bin\geos_c.dll",
-)
+if os.getenv("GDAL_LIBRARY_PATH"):
+    GDAL_LIBRARY_PATH = os.environ["GDAL_LIBRARY_PATH"]
+if os.getenv("GEOS_LIBRARY_PATH"):
+    GEOS_LIBRARY_PATH = os.environ["GEOS_LIBRARY_PATH"]
 CACHES = {
     "default": {
         "BACKEND": "django.core.cache.backends.locmem.LocMemCache",

@@ -1,46 +1,12 @@
-import polars as pl
-
 from __future__ import annotations
 from pathlib import Path
+from apps.ingestion.helpers import read_gtfs_file, gtfs_time_to_seconds
 
-GTFS_ROUTE_TYPES = [1, 2]
+import polars as pl
 
-
-def gtfs_time_to_seconds(column_name: str) -> pl.Expr:
-    """Convert a GTFS HH:MM:SS value into seconds from midnight."""
-    hours = (
-        pl.col(column_name)
-        .str.extract(r"^(\d+):\d{2}:\d{2}$", 1)
-        .cast(pl.Int64)
-    )
-    minutes = (
-        pl.col(column_name)
-        .str.extract(r"^\d+:(\d{2}):\d{2}$", 1)
-        .cast(pl.Int64)
-    )
-    seconds = (
-        pl.col(column_name)
-        .str.extract(r"^\d+:\d{2}:(\d{2})$", 1)
-        .cast(pl.Int64)
-    )
-
-    return (hours * 3600 + minutes * 60 + seconds).alias(column_name)
-
-
-def read_gtfs_file(resources_dir: Path, filename: str) -> pl.LazyFrame:
-    """Read a GTFS CSV file lazily."""
-    return pl.scan_csv(
-        resources_dir / filename,
-        separator=",",
-        null_values=["", "NA", "null"],
-        try_parse_dates=False,
-        infer_schema_length=1000,
-    )
-
-
-def parse_stops(resources_dir: Path) -> pl.DataFrame:
-    """Parse stops and keep fields used by the Stop model."""
-    return (
+def parse_stops(resources_dir: Path) -> pl.LazyFrame:
+    """Parse the canonical GTFS stops table."""
+    stops = (
         read_gtfs_file(resources_dir, "stops.txt")
         .select(
             [
@@ -55,19 +21,18 @@ def parse_stops(resources_dir: Path) -> pl.DataFrame:
         .rename({"parent_station": "parent_stop_id"})
         .with_columns(
             [
-                pl.col("stop_name").cast(pl.String),
                 pl.col("stop_lat").cast(pl.Float64, strict=False),
                 pl.col("stop_lon").cast(pl.Float64, strict=False),
                 pl.col("location_type").cast(pl.Int64, strict=False),
-                pl.col("parent_stop_id").cast(pl.String),
             ]
         )
-        .collect()
     )
 
+    return stops
 
-def parse_routes(resources_dir: Path) -> pl.DataFrame:
-    """Parse only metro and RER routes."""
+
+def parse_routes(resources_dir: Path) -> pl.LazyFrame:
+    """Parse all routes."""
     routes = (
         read_gtfs_file(resources_dir, "routes.txt")
         .select(
@@ -87,25 +52,28 @@ def parse_routes(resources_dir: Path) -> pl.DataFrame:
                 pl.col("route_color").cast(pl.String),
             ]
         )
-        .filter(pl.col("route_type").is_in(GTFS_ROUTE_TYPES))
         .with_columns(
-            pl.when(pl.col("route_type") == 1)
-            .then(pl.lit("metro"))
-            .when(pl.col("route_type") == 2)
-            .then(pl.lit("rer"))
-            .otherwise(pl.lit(None))
+            pl.when(pl.col("route_type") == 0).then(pl.lit("tram"))
+            .when(pl.col("route_type") == 1).then(pl.lit("metro"))
+            .when(pl.col("route_type") == 2).then(pl.lit("train"))
+            .when(pl.col("route_type") == 3).then(pl.lit("bus"))
+            .when(pl.col("route_type") == 4).then(pl.lit("ferry"))
+            .when(pl.col("route_type") == 5).then(pl.lit("cable_tram"))
+            .when(pl.col("route_type") == 6).then(pl.lit("cable car"))
+            .when(pl.col("route_type") == 7).then(pl.lit("funicular"))
+            .otherwise(pl.lit("unknown"))
             .alias("route_type_name")
         )
     )
 
-    return routes.collect()
+    return routes
 
 
 def parse_trips(
     resources_dir: Path,
-    routes: pl.DataFrame,
-) -> pl.DataFrame:
-    """Parse trips belonging to metro and RER routes."""
+    routes: pl.LazyFrame,
+) -> pl.LazyFrame:
+    """Parse trips belonging to the specified routes."""
     route_ids = routes.select("route_id")
 
     return (
@@ -127,52 +95,40 @@ def parse_trips(
                 pl.col("trip_short_name").cast(pl.String),
             ]
         )
-        .join(route_ids.lazy(), on="route_id", how="inner")
-        .collect()
+        .join(route_ids, on="route_id", how="inner")
     )
 
 
 def parse_stop_times(
     resources_dir: Path,
-    trips: pl.DataFrame,
-) -> pl.DataFrame:
-    """Parse stop times belonging to metro and RER trips."""
-    trip_ids = trips.select("trip_id")
+    trips: pl.LazyFrame
+) -> pl.LazyFrame:
+    """Parse canonical stop times and normalize times to seconds."""
+    stop_times = (
+        trips.select(["trip_id", "route_id", "service_id"])
+        .join(read_gtfs_file(resources_dir, "stop_times.txt"),
+              on="trip_id",
+              how="inner")
+    )
 
-    return (
-        read_gtfs_file(resources_dir, "stop_times.txt")
-        .select(
-            [
-                "trip_id",
-                "stop_id",
-                "arrival_time",
-                "departure_time",
-                "stop_sequence",
-            ]
-        )
-        .join(trip_ids.lazy(), on="trip_id", how="inner")
-        .with_columns(
-            [
-                gtfs_time_to_seconds("arrival_time"),
-                gtfs_time_to_seconds("departure_time"),
-                pl.col("stop_sequence").cast(pl.Int64),
-            ]
-        )
-        .select(
-            [
-                "trip_id",
-                "stop_id",
-                "arrival_time",
-                "departure_time",
-                "stop_sequence",
-            ]
-        )
-        .sort(["trip_id", "stop_sequence"])
-        .collect()
+    selected_columns = [
+        "trip_id",
+        "stop_id",
+        "stop_sequence",
+        "arrival_time",
+        "departure_time"
+    ]
+
+    return stop_times.select(selected_columns).with_columns(
+        [
+            pl.col("stop_sequence").cast(pl.Int64),
+            gtfs_time_to_seconds("arrival_time"),
+            gtfs_time_to_seconds("departure_time"),
+        ]
     )
 
 
-def parse_calendar(resources_dir: Path) -> pl.DataFrame:
+def parse_calendar(resources_dir: Path) -> pl.LazyFrame:
     """Parse recurring service calendars."""
     day_columns = [
         "monday",
@@ -189,39 +145,46 @@ def parse_calendar(resources_dir: Path) -> pl.DataFrame:
         .select(["service_id", *day_columns, "start_date", "end_date"])
         .with_columns(
             [
-                pl.col(column).cast(pl.Boolean, strict=False)
-                for column in day_columns
+                pl.col("start_date").cast(pl.String).str.strptime(pl.Date, "%Y%m%d"),
+                pl.col("end_date").cast(pl.String).str.strptime(pl.Date, "%Y%m%d"),
+                *[pl.col(column).cast(pl.Boolean, strict=False)for column in day_columns],
             ]
         )
-        .collect()
     )
 
 
-def parse_calendar_dates(resources_dir: Path) -> pl.DataFrame:
+def parse_calendar_dates(resources_dir: Path) -> pl.LazyFrame:
     """Parse service exceptions."""
     return (
         read_gtfs_file(resources_dir, "calendar_dates.txt")
         .select(["service_id", "date", "exception_type"])
         .with_columns(
+            pl.col("date").cast(pl.String).str.strptime(pl.Date, "%Y%m%d"),
             pl.col("exception_type").cast(pl.Int64),
         )
-        .collect()
     )
 
 
 def parse_transfers(
     resources_dir: Path,
-    stops: pl.DataFrame,
-) -> pl.DataFrame:
+    stops: pl.DataFrame | pl.LazyFrame,
+) -> pl.LazyFrame:
     """Parse explicit transfers and infer transfers within parent stations."""
+    transfers_file = read_gtfs_file(resources_dir, "transfers.txt")
+    transfer_columns = transfers_file.collect_schema().names()
+    min_transfer_time = (
+        pl.col("min_transfer_time")
+        if "min_transfer_time" in transfer_columns
+        else pl.lit(0)
+    ).alias("min_transfer_time")
     explicit_transfers = (
-        read_gtfs_file(resources_dir, "transfers.txt")
+        transfers_file
         .select(
             [
                 "from_stop_id",
                 "to_stop_id",
                 "transfer_type",
-                "min_transfer_time",
+                min_transfer_time,
             ]
         )
         .with_columns(
@@ -234,8 +197,9 @@ def parse_transfers(
         )
     )
 
+    stops_lazy = stops.lazy() if isinstance(stops, pl.DataFrame) else stops
     child_stops = (
-        stops.lazy()
+        stops_lazy
         .filter(pl.col("parent_stop_id").is_not_null())
         .select(["stop_id", "parent_stop_id"])
     )
@@ -277,83 +241,4 @@ def parse_transfers(
             how="vertical_relaxed",
         )
         .unique(subset=["from_stop_id", "to_stop_id"])
-        .collect()
     )
-
-
-def parse_parent_child_stops(stops: pl.DataFrame) -> pl.DataFrame:
-    """Build parent stations with their child stops."""
-    parents = (
-        stops.filter(pl.col("parent_stop_id").is_null())
-        .select(
-            [
-                pl.col("stop_id"),
-                pl.col("stop_name"),
-            ]
-        )
-    )
-
-    children = (
-        stops.filter(pl.col("parent_stop_id").is_not_null())
-        .select(
-            [
-                pl.col("parent_stop_id"),
-                pl.col("stop_id").alias("child_stop_id"),
-                pl.col("stop_name").alias("child_stop_name"),
-            ]
-        )
-    )
-
-    return (
-        parents.join(
-            children,
-            left_on="stop_id",
-            right_on="parent_stop_id",
-            how="left",
-        )
-        .group_by(["stop_id", "stop_name"])
-        .agg(
-            [
-                pl.col("child_stop_id").drop_nulls().alias("child_stop_ids"),
-                pl.col("child_stop_name")
-                .drop_nulls()
-                .alias("child_stop_names"),
-            ]
-        )
-        .rename(
-            {
-                "stop_id": "parent_stop_id",
-            }
-        )
-        .collect()
-    )
-
-
-def parse_gtfs(resources_dir: str | Path | None = None) -> dict[str, pl.DataFrame]:
-    """Parse all GTFS files needed by the HERMES V1 routing system."""
-    if resources_dir is None:
-        resources_path = (
-            Path(__file__).resolve().parents[2] / "ressources"
-        )
-    else:
-        resources_path = Path(resources_dir)
-
-    stops = parse_stops(resources_path)
-    routes = parse_routes(resources_path)
-    trips = parse_trips(resources_path, routes)
-    stop_times = parse_stop_times(resources_path, trips)
-    calendar = parse_calendar(resources_path)
-    calendar_dates = parse_calendar_dates(resources_path)
-    transfers = parse_transfers(resources_path, stops)
-    parent_child_stops = parse_parent_child_stops(stops)
-
-    return {
-        "stops": stops,
-        "routes": routes,
-        "trips": trips,
-        "stop_times": stop_times,
-        "calendar": calendar,
-        "calendar_dates": calendar_dates,
-        "transfers": transfers,
-        "parent_child_stops": parent_child_stops,
-    }

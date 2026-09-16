@@ -13,27 +13,48 @@ class GTFSDataStore:
     def __init__(self) -> None:
         self.stops = self._load_table(
             """
-            SELECT stop_id, stop_name, stop_lat, stop_lon,
-                   location_type, parent_stop_id
+            SELECT stop_id, stop_name, location_type, parent_stop_id
             FROM gtfs_stops
             """
         )
         self.routes = self._load_table(
             """
-            SELECT route_id, route_short_name, route_long_name,
-                   route_type, route_type_name, route_color
+            SELECT route_id, route_long_name, route_type, route_type_name, route_color
             FROM gtfs_routes
             """
         )
         self.trips = self._load_table(
             """
-            SELECT trip_id, route_id, service_id, trip_headsign,
-                   trip_short_name, direction_id
+            SELECT trip_id, route_id, service_id, trip_headsign, direction_id
             FROM gtfs_trips
             """
         )
         self.stop_times = self._load_table(
-            "SELECT trip_id, stop_id FROM gtfs_stop_times"
+            """
+            SELECT trip_id, stop_id, arrival_time, departure_time, stop_sequence
+            FROM gtfs_stop_times
+            """
+        )
+
+        self.transfers = self._load_table(
+            """
+            SELECT from_stop_id, to_stop_id, min_transfer_time
+            FROM gtfs_transfers
+            """
+        )
+
+        self.calendars = self._load_table(
+            """
+            SELECT service_id, monday, tuesday, wednesday, thursday, friday, saturday, sunday, start_date, end_date
+            FROM gtfs_calendar
+            """
+        )
+
+        self.calendar_dates = self._load_table(
+            """
+            SELECT service_id, date, exception_type
+            FROM gtfs_calendar_dates
+            """
         )
 
     @staticmethod

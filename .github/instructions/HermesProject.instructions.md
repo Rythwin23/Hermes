@@ -1,294 +1,194 @@
 ---
-description: Describe when these instructions should be loaded by the agent based on task context
+description: Architecture and conventions for the HERMES transit data platform.
 applyTo: "**"
 ---
 
-# HERMES — Copilot Instructions
+# HERMES - Copilot Instructions
 
-**HERMES** (Hybrid Engine for Routing, Mobility & Exploration Systems) is a self-contained transit routing API built from scratch for the Ile-de-France public transport network. It ingests open GTFS data from PRIM (Ile-de-France Mobilités), stores it in MongoDB, and exposes a REST API via Django — with no dependency on Navitia or any third-party routing API.
-
----
+HERMES (Hybrid Engine for Routing, Mobility & Exploration Systems) is a transit data platform for the Ile-de-France public transport network. It ingests GTFS data from PRIM (Ile-de-France Mobilites), parses it with Polars, stores it in PostgreSQL/PostGIS through the Django ORM, and exposes a Django API. It does not depend on Navitia or another third-party routing API.
 
 ## Tech Stack
 
-| Layer             | Technology                                   |
-| ----------------- | -------------------------------------------- |
-| Backend           | Python 3.12+ / Django REST Framework         |
-| Database          | MongoDB                                      |
-| Data processing   | Polars                                       |
-| Frontend (future) | Angular                                      |
-| Data source       | GTFS static — PRIM / Ile-de-France Mobilités |
+| Layer           | Technology                                         |
+| --------------- | -------------------------------------------------- |
+| Backend         | Python 3.12+ / Django                              |
+| Database        | PostgreSQL 16 + PostGIS 3.4                        |
+| Data processing | Polars                                             |
+| Frontend        | Angular 21, TypeScript, Angular Router and AG Grid |
+| API formats     | JSON by default; optional MessagePack and gzip     |
+| Data source     | GTFS static - PRIM / Ile-de-France Mobilites       |
 
----
+## Project Status
 
-## Scope
+### Implemented
 
-### V1 — Active
+- GTFS parsing with Polars.
+- Atomic PostgreSQL/PostGIS loading through Django and psycopg `COPY`.
+- GTFS time normalization, including values beyond `24:00:00`.
+- Django models for stops, routes, trips, stop times, calendars and transfers.
+- Explicit transfers and transfers inferred from `parent_station`.
+- In-memory Polars snapshot used by network services.
+- Network API for stops and routes.
+- Angular foundation with home, navigation and referentials screens.
 
-- Metro network
-- RER network
-- A→B itinerary computation using RAPTOR algorithm
-- Stations list
-- Lines list with served stops
-- Transfer handling between stations
+### In Development
+
+- RAPTOR itinerary computation and routing data structures.
+- Bus, Tram and Transilien support.
 
 ### Future
 
-- Bus, Tram, Transilien
-- Real-time updates (GTFS-RT / SIRI Lite)
-- Angular frontend
-- Accessibility (PMR)
-- Isochrone computation
+- Caching of frequently accessed data using Redis
+- Real-time updates (GTFS-RT / SIRI Lite).
+- Accessibility (PMR) and isochrone computation.
+- Adding others data sources (e.g., Accessibility, affluence, real-time updates)
 
----
+## Data Source and Ingestion
 
-## Data Source — GTFS Static
+Source files are stored directly in `backend/ressources/`:
 
-Downloaded from [prim.iledefrance-mobilites.fr](https://prim.iledefrance-mobilites.fr). Updated 3x/day (08:00, 13:00, 17:00). No third-party routing API is used.
+- `stops.txt`: stops, coordinates, location types and parent stations.
+- `routes.txt`: transit routes and display metadata.
+- `trips.txt`: trips, services and directions.
+- `stop_times.txt`: scheduled times and stop sequences.
+- `transfers.txt`: explicit transfer rules.
+- `calendar.txt` and `calendar_dates.txt`: recurring services and exceptions.
 
-| File                 | Content                                         |
-| -------------------- | ----------------------------------------------- |
-| `stops.txt`          | Stations, GPS coordinates, `parent_station`     |
-| `routes.txt`         | Lines filtered by `route_type` (1=Metro, 2=RER) |
-| `trips.txt`          | Trips per line and service calendar             |
-| `stop_times.txt`     | Scheduled stop times per trip                   |
-| `transfers.txt`      | Explicit transfers between stops                |
-| `calendar.txt`       | Service patterns (weekday / weekend / holiday)  |
-| `calendar_dates.txt` | Calendar exceptions                             |
+The parser loads route types present in the source feed; do not assume that only Metro and RER are loaded. `shapes.txt`, fare files and other unsupported GTFS files are outside the current pipeline.
 
-Ignored in V1: `shapes.txt`, `fare_*.txt`
+`parent_station` is critical: implicit transfers between child stops in the same station supplement `transfers.txt`.
 
-**Important:** Implicit transfers must also be inferred from `parent_station` in `stops.txt`, not only from `transfers.txt`.
+```text
+GTFS files in backend/ressources/
+        |
+        v
+Parse with Polars LazyFrames
+        |
+        v
+Normalize times and infer parent-station transfers
+        |
+        v
+Atomically replace PostgreSQL tables using psycopg COPY
+        |
+        v
+Populate PostGIS stop geography
+        |
+        v
+Reload the in-memory Polars GTFS snapshot
+```
 
----
+`apps.ingestion.loader.load_gtfs()` replaces source tables in a transaction. After commit, `GTFSDataStore` is rebuilt for network services. Use Polars, not pandas; `stop_times.txt` is the largest file.
 
 ## Project Structure
 
-```
+```text
 backend/
-├── ressources/
-│   └── gtfs/                   # Raw GTFS files (.zip and extracted)
-├── ingestion/
-│   ├── downloader.py           # GTFS zip download
-│   ├── parser.py               # Polars-based GTFS parsing
-│   └── loader.py               # MongoDB insertion
-├── core/
-│   ├── models/                 # MongoEngine models (Stop, Route, Trip, StopTime, Transfer)
-│   ├── raptor/
-│   │   ├── data_structures.py  # RAPTOR-specific in-memory structures
-│   │   └── algorithm.py        # RAPTOR implementation
-│   └── services/
-│       └── itinerary.py        # Itinerary business logic
-├── api/
-│   ├── urls.py
-│   └── views/
-│       ├── stops.py
-│       ├── routes.py
-│       └── itinerary.py
-├── config/
-│   └── settings.py
+├── apps/
+│   ├── config/                 # Django settings and root URLs
+│   ├── ingestion/              # GTFS parsers, loader and management command
+│   ├── network/                # Models, snapshot, services and API
+│   └── routing/                # Routing application under development
+├── ressources/                 # GTFS source files
 └── manage.py
+frontend/
+└── hermes/                     # Angular application
 ```
 
----
+## Database and Models
 
-## Data Models (MongoDB)
+Persistence uses PostgreSQL/PostGIS. Django models map to PostgreSQL tables prefixed with `gtfs_`:
 
-### Stop
+- `Stop`: identifier, name, coordinates, PostGIS geography, location type and nullable `parent_stop` self-reference.
+- `Route`: identifier, names, `route_type`, derived `route_type_name` and display color.
+- `Trip`: route, service identifier, headsign, short name and direction.
+- `StopTime`: trip, stop, arrival/departure times as integer seconds, and stop sequence.
+- `Calendar` and `CalendarDate`: recurring services and date exceptions.
+- `Transfer`: source stop, target stop, transfer type and minimum transfer time.
 
-```json
-{
-  "stop_id": "string",
-  "stop_name": "string",
-  "stop_lat": "float",
-  "stop_lon": "float",
-  "parent_station": "string | null",
-  "location_type": "int"
-}
-```
+GTFS times are stored as integer seconds from service-day midnight. Values beyond `24:00:00` are valid and must remain correctly represented.
 
-### Route
+## URLs and API
 
-```json
-{
-  "route_id": "string",
-  "route_short_name": "string",
-  "route_long_name": "string",
-  "route_type": "int"
-}
-```
-
-### Trip
-
-```json
-{
-  "trip_id": "string",
-  "route_id": "string",
-  "service_id": "string",
-  "direction_id": "int"
-}
-```
-
-### StopTime
-
-```json
-{
-  "trip_id": "string",
-  "stop_id": "string",
-  "arrival_time": "string",
-  "departure_time": "string",
-  "stop_sequence": "int"
-}
-```
-
-### Transfer
-
-```json
-{
-  "from_stop_id": "string",
-  "to_stop_id": "string",
-  "transfer_type": "int",
-  "min_transfer_time": "int"
-}
-```
-
----
-
-## Ingestion Pipeline
-
-```
-Download GTFS zip from PRIM
-        ↓
-Extract and parse with Polars
-        ↓
-Filter Metro + RER (route_type in [1, 2])
-        ↓
-Normalize times (handle times > 24:00:00)
-        ↓
-Insert into MongoDB
-        ↓
-Build in-memory RAPTOR data structures
-        ↓
-API ready
-```
-
----
-
-## Routing Algorithm — RAPTOR
-
-HERMES uses the **RAPTOR** (Round-Based Public Transit Optimized Router) algorithm. Do not use Dijkstra or A\* — they are not natively time-aware and are not suited for schedule-based transit routing.
-
-### Core concepts
-
-- **Round**: one additional transit leg (transfer)
-- **Earliest arrival**: tracked per stop per round
-- **Route scanning**: for each round, scan all routes passing through reached stops, find the earliest trip that can be boarded
-- **Transfers**: after each round, propagate footpath transfers (from `transfers.txt` + `parent_station`)
-
-### Key data structures (built in-memory from MongoDB at startup)
+The root Django URL configuration includes both applications below `/api/`:
 
 ```python
-# stops_in_route[route_id] -> ordered list of stop_ids
-# routes_at_stop[stop_id]  -> list of route_ids serving this stop
-# trips[route_id]          -> list of trips ordered by departure time
-# stop_times[trip_id]      -> ordered list of (stop_id, arrival, departure)
-# transfers[stop_id]       -> list of (target_stop_id, min_transfer_time)
+path("api/", include("apps.network.urls"))
+path("api/", include("apps.routing.urls"))
 ```
 
-### Algorithm flow
+Current network endpoints:
 
+| Method | URL                      | Description                                |
+| ------ | ------------------------ | ------------------------------------------ |
+| GET    | `/api/stops`             | List stops                                 |
+| GET    | `/api/stops/<stop_id>`   | Stop detail, child stops and served routes |
+| GET    | `/api/routes`            | List routes                                |
+| GET    | `/api/routes/<route_id>` | Stops served by a route                    |
+
+`apps.routing.urls` currently defines no routes. There is no `/api/itinerary` endpoint yet.
+
+Responses are JSON by default. With `Accept: application/msgpack`, network responses can use MessagePack; `Accept-Encoding: gzip` enables gzip compression.
+
+Keep business logic in `apps.network.services` or another service module, not in views. Database-specific SQL belongs in ingestion or the dataset layer where required for COPY/PostGIS operations.
+
+## Frontend URLs
+
+The Angular application is in `frontend/hermes`. Current client-side routes are:
+
+| URL             | Component      | Status                                       |
+| --------------- | -------------- | -------------------------------------------- |
+| `/`             | `Home`         | Available                                    |
+| `/naviguer`     | `Naviguer`     | UI foundation; backend itinerary unavailable |
+| `/referentiels` | `Referentiels` | Available for stops and routes               |
+
+Development uses the Angular proxy for the Django API. Keep frontend claims consistent with backend availability.
+
+## Routing - RAPTOR Planned
+
+The target algorithm is RAPTOR (Round-Based Public Transit Optimized Router). Use timetable-aware route scanning, earliest-arrival labels per round, transfer footpaths, service calendars and a bounded maximum number of rounds. Do not replace RAPTOR with Dijkstra or A\* without an explicit architecture decision.
+
+Intended structures include:
+
+```python
+# stops_in_route[route_id] -> ordered stop IDs
+# routes_at_stop[stop_id] -> route IDs
+# trips[route_id] -> trips ordered by departure time
+# stop_times[trip_id] -> ordered (stop_id, arrival, departure)
+# transfers[stop_id] -> (target_stop_id, minimum transfer time)
 ```
-Input: source_stop, target_stop, departure_datetime
-
-1. Initialize: earliest[source_stop] = departure_time, all others = INF
-2. For each round k (max_transfers):
-   a. Find all routes passing through stops reached in round k-1
-   b. For each route, scan stops in order:
-      - Board earliest trip after current earliest arrival
-      - Update earliest[stop] if trip arrives earlier
-   c. Apply footpath transfers from newly reached stops
-3. Return earliest[target_stop] with reconstructed journey
-```
-
-### Constraints
-
-- RAPTOR is timetable-based: stop_times must be loaded and sorted at startup
-- Handle GTFS times > `24:00:00` (e.g., `25:30:00` = next-day 01:30 AM for night services)
-- Cap maximum rounds (transfers) — recommended: 5
-
----
-
-## REST API
-
-| Method | Endpoint                 | Description            |
-| ------ | ------------------------ | ---------------------- |
-| GET    | `/api/stops`             | List all stations      |
-| GET    | `/api/stops/<id>`        | Station detail         |
-| GET    | `/api/routes`            | List all lines         |
-| GET    | `/api/routes/<id>/stops` | Stops served by a line |
-| POST   | `/api/itinerary`         | Compute A→B itinerary  |
-
-### Itinerary request
-
-```json
-{
-  "from_stop_id": "IDFM:StopPoint:59:3619523",
-  "to_stop_id": "IDFM:StopPoint:59:3622010",
-  "datetime": "2025-01-15T08:30:00"
-}
-```
-
-### Itinerary response
-
-```json
-{
-  "duration_minutes": 24,
-  "legs": [
-    {
-      "route": "Ligne 1",
-      "from_stop": "Châtelet",
-      "to_stop": "La Défense",
-      "departure": "08:34:00",
-      "arrival": "08:54:00"
-    }
-  ],
-  "transfers": 0
-}
-```
-
----
 
 ## Code Conventions
 
-- Python 3.11+, PEP8 strictly enforced
-- Type hints on all functions and methods
-- Comments in English, only when logic is non-obvious
-- `snake_case` for variables and functions
-- `PascalCase` for classes
-- No business logic in Django views — use `services/`
-- No raw queries in views — use model methods or repositories
-
----
+- Python 3.12+, PEP 8 and existing project formatting.
+- Type hints on all functions and methods.
+- English comments only when logic is non-obvious.
+- `snake_case` for variables and functions; `PascalCase` for classes.
+- Keep views thin and delegate business logic to services.
+- Use Django ORM models for persistence and Polars for GTFS parsing and snapshots.
+- Validate external input at API boundaries and handle errors intentionally.
+- Preserve existing public APIs and avoid unrelated refactors.
 
 ## Known Pitfalls
 
-- `stop_times.txt` is the largest file — always use Polars, never pandas
-- GTFS times can exceed `24:00:00` for night services — normalize before storing
-- `transfers.txt` is incomplete — always supplement with `parent_station` grouping
-- GTFS zip is updated 3x/day — plan a periodic re-ingestion task (Celery or cron)
-- RAPTOR data structures must be rebuilt after each re-ingestion
-
----
+- `transfers.txt` is incomplete; supplement it with `parent_station` grouping.
+- Source files live directly in `backend/ressources/`; no downloader or `ressources/gtfs/` directory currently exists.
+- Reload `GTFSDataStore` after successful re-ingestion.
+- PostgreSQL/PostGIS, GDAL and GEOS are runtime prerequisites.
+- Verify the feed and parser before adding route-type filtering.
+- Do not claim real-time routing, RAPTOR itinerary results or an itinerary endpoint without implementing and exposing them.
 
 ## CLI Commands
 
 ```bash
-# Download and ingest GTFS data
-python manage.py ingest_gtfs
+# From the repository root
+python backend/manage.py migrate
+python backend/manage.py ingest_gtfs
+python backend/manage.py runserver
+python backend/manage.py test
 
-# Start development server
-python manage.py runserver
-
-# Run tests
-python manage.py test
+# Frontend
+cd frontend/hermes
+npm install
+npm start
+npm test
 ```

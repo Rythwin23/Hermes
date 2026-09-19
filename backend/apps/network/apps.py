@@ -6,5 +6,6 @@ class NetworkConfig(AppConfig):
     name = "apps.network"
 
     def ready(self):
-        from apps.network.dataset import GTFSDataStore
-        GTFSDataStore.get()
+        # Keep the GTFS snapshot lazy: loading it in ready() creates a large
+        # memory spike at startup even when routing is not used yet.
+        return

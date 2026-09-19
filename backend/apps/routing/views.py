@@ -31,7 +31,7 @@ def _stop_id_from_name(stop_name: str) -> str | None:
 		return next(iter(parent_ids))
 	return matches.select("stop_id").to_series()[0]
 
-def _DateTime_to_seconds(time: str) -> int:
+def _DateTime_to_seconds(time: str | int) -> int:
 	"""
 	Convert a DateTime HH:MM:SS to seconds.
 	Args:
@@ -39,20 +39,24 @@ def _DateTime_to_seconds(time: str) -> int:
 	Returns:
 		int: Time in seconds.
 	"""
+	if isinstance(time, int):
+		if time < 0:
+			raise ValueError
+		return time
+	if not isinstance(time, str):
+		raise ValueError
 	if time.isdigit():
 		return int(time)
 
 	# Manual split (not datetime.strptime) because GTFS allows hours >= 24
 	# for trips continuing past midnight (e.g. "25:30:00").
 	hours_str, minutes_str, seconds_str = time.split(":")
-	# If the hour is not in the early morning range, calculate normally.
-	if hours_str not in ["00", "01", "02", "03"]:
-		time_in_seconds = int(hours_str) * 3600 + int(minutes_str) * 60 + int(seconds_str)
-	# Otherwise, it's early morning then must be handled separately (e.g., after midnight).
-	else:
-		hours_str = int(hours_str) + 24  # Adjust early morning hours past midnight
-		time_in_seconds = hours_str * 3600 + int(minutes_str) * 60 + int(seconds_str)
-	return time_in_seconds
+	hours = int(hours_str)
+	minutes = int(minutes_str)
+	seconds = int(seconds_str)
+	if minutes >= 60 or seconds >= 60:
+		raise ValueError
+	return hours * 3600 + minutes * 60 + seconds
 
 
 @require_POST
@@ -135,7 +139,7 @@ def raptor_test(request: HttpRequest):
 		target_stop_id=target_stop_id,
 		departure_time=departure_time,
 		travel_date=travel_day,
-		max_transfers=5,
+		max_rounds=7,
 		max_results=5,
 	)
 	return api_response(request, payload)

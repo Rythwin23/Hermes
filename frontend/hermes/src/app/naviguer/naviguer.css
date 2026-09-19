@@ -45,13 +45,68 @@ label {
   color: var(--muted);
 }
 
-input {
+input,
+select {
   height: 46px;
   border: 1px solid var(--border);
   background: #fbfcfb;
   border-radius: 7px;
   padding: 0.7rem 0.9rem;
   color: #1a2d3d;
+}
+
+.stop-search {
+  position: relative;
+}
+
+.stop-search input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.suggestions {
+  position: absolute;
+  z-index: 2;
+  top: calc(100% + 0.25rem);
+  left: 0;
+  right: 0;
+  display: grid;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #ffffff;
+  box-shadow: var(--shadow);
+}
+
+.suggestions button {
+  border: 0;
+  border-bottom: 1px solid #edf1ed;
+  padding: 0.7rem 0.9rem;
+  background: #ffffff;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.suggestions button:last-child {
+  border-bottom: 0;
+}
+
+.suggestions button:hover,
+.suggestions button:focus-visible {
+  background: #edf1ed;
+}
+
+select:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+.loading-hint {
+  grid-column: 1 / -1;
+  margin: -0.35rem 0 0;
+  color: var(--muted);
+  font-size: 0.85rem;
 }
 
 .search-btn {
@@ -88,6 +143,90 @@ input {
 .table-header span {
   color: #5d6d7d;
   font-weight: 600;
+}
+
+.error-message {
+  margin: 0 0 1.5rem;
+  padding: 1rem;
+  border: 1px solid #f0b7b7;
+  background: #fff5f5;
+  color: #9b2c2c;
+  border-radius: 7px;
+}
+
+.details-panel {
+  margin-top: 1.25rem;
+  border: 1px solid rgba(18, 44, 75, 0.08);
+  background: #f9fbff;
+  border-radius: 8px;
+  padding: 1rem 1.1rem;
+}
+
+.details-panel h4 {
+  margin: 0 0 0.5rem;
+  color: var(--text);
+}
+
+.details-panel > p {
+  margin: 0 0 1rem;
+  color: #5d6d7d;
+  font-weight: 600;
+}
+
+.leg {
+  padding: 0.75rem 0;
+  border-top: 1px solid rgba(18, 44, 75, 0.08);
+}
+
+.leg:first-of-type {
+  border-top: none;
+}
+
+.leg-header {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.leg-header.transfer {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.line-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 2rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 5px;
+  color: #ffffff;
+  font-weight: 700;
+  font-size: 0.8rem;
+}
+
+.leg-title {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.leg-time {
+  margin-left: auto;
+  color: #5d6d7d;
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.stop-list {
+  margin: 0.6rem 0 0;
+  padding-left: 1.2rem;
+  color: #334b63;
+  font-size: 0.88rem;
+}
+
+.stop-list li + li {
+  margin-top: 0.35rem;
 }
 
 @media (max-width: 916px) {

@@ -3,3 +3,4 @@ __pycache__
 ressources
 *.pdf
 .env
+bruno_endpoints/*

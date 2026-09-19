@@ -1,5 +1,6 @@
 import { Component } from '@angular/core';
 import { RouterLink, RouterLinkActive, RouterOutlet } from '@angular/router';
+import { StopsStore } from './stops-store';
 
 @Component({
   selector: 'app-root',
@@ -7,4 +8,8 @@ import { RouterLink, RouterLinkActive, RouterOutlet } from '@angular/router';
   templateUrl: './app.html',
   styleUrl: './app.css',
 })
-export class App {}
+export class App {
+  constructor(stopsStore: StopsStore) {
+    stopsStore.load();
+  }
+}

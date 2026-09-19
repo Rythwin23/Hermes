@@ -1,10 +1,10 @@
-"""Static timetable structures and the round-based RAPTOR algorithm.
+"""RAPTOR routing engine: simple, fast and functional.
 
-`RaptorModelBuilder` turns the GTFS RAM snapshot (`GTFSDataStore`) into
-date-independent structures grouped by "pattern" (trips sharing the same
-ordered stop sequence, since a single GTFS route can have several branches).
-`RaptorModel` filters those patterns to the trips active on a given service
-date and runs the RAPTOR rounds to find the earliest arrival journey.
+Version multicritère (McRAPTOR) : un seul bag de labels Pareto-optimaux
+par arrêt (pas par round). Critères comparés : heure d'arrivée, nombre
+de correspondances physiques (changements de trip_id réels, pas de
+segments de route), temps de marche cumulé. Le round ne sert plus qu'à
+borner l'exploration (nombre max de correspondances autorisées).
 """
 
 from __future__ import annotations
@@ -13,383 +13,508 @@ import bisect
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
-from threading import Lock
-
+import logging
 import polars as pl
 
 from apps.network.dataset import GTFSDataStore
 
+logger = logging.getLogger(__name__)
+
 INF = float("inf")
-_WEEKDAYS = (
-    "monday",
-    "tuesday",
-    "wednesday",
-    "thursday",
-    "friday",
-    "saturday",
-    "sunday",
-)
+MIN_TRANSFER_SECONDS = 60
+MAX_LABELS_PER_STOP = 5  # borne le coût mémoire/temps du front de Pareto par arrêt
+WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+
+@dataclass
+class Timetable:
+    """Structure mémoire plate et optimisée pour RAPTOR."""
+    stops: list[str]                         # index int -> stop_id
+    stop_to_idx: dict[str, int]              # stop_id -> index int
+    routes_stops: list[list[int]]            # [route_idx] -> liste de stop_idx
+    routes_trips: list[list[dict]]           # [route_idx] -> [{trip_id, service_id, dep, arr}]
+    routes_at_stop: list[list[tuple[int, int]]] # [stop_idx] -> [(route_idx, stop_pos)]
+    transfers: list[list[tuple[int, int]]]   # [stop_idx] -> [(target_stop_idx, duration)]
 
 
 @dataclass(frozen=True)
-class PatternTrip:
-    trip_id: str
-    arrivals: tuple[int, ...]  # arrival_time per stop index of the pattern
-    departures: tuple[int, ...]  # departure_time per stop index of the pattern
-
-
-@dataclass(frozen=True)
-class Pattern:
-    pattern_id: int
-    stop_ids: tuple[str, ...]
-    trips: tuple[PatternTrip, ...]  # sorted by departures[0]
-
-
-@dataclass(frozen=True)
-class RideStop:
-    """A stop served while riding a trip leg, with its own schedule."""
-
-    stop_id: str
-    arrival_time: int
-    departure_time: int
-
-
-@dataclass(frozen=True)
-class Leg:
-    """One boarded trip, or a foot transfer when trip_id is None."""
-
+class JourneyLeg:
+    trip_id: str | None  # None = marche
     from_stop: str
     to_stop: str
-    departure_time: int | None
-    arrival_time: int | None
-    trip_id: str | None
-    stops: tuple[RideStop, ...] = ()  # boarding to alighting inclusive, trip legs only
+    departure_time: int
+    arrival_time: int
 
 
 @dataclass(frozen=True)
 class Journey:
+    departure_time: int
     arrival_time: int
-    legs: tuple[Leg, ...]
-
-    @property
-    def transfer_count(self) -> int:
-        boarded_trips = sum(1 for leg in self.legs if leg.trip_id is not None)
-        return max(boarded_trips - 1, 0)
+    duration_minutes: int
+    walk_seconds: int
+    transfers: int
+    legs: list[JourneyLeg]
 
 
-class RaptorModelBuilder:
-    """Builds the static, date-independent timetable used by RAPTOR."""
+@dataclass(frozen=True)
+class Label:
+    """État Pareto-optimal à un arrêt donné.
 
-    def __init__(self, data: GTFSDataStore | None = None) -> None:
-        self._data = data or GTFSDataStore.get()
+    parent référence directement le Label précédent dans la chaîne :
+    la reconstruction du trajet suit cette chaîne sans avoir à
+    rechercher/deviner quel label antérieur correspond.
 
-    def build(self) -> RaptorModel:
-        patterns = self._build_patterns()
-        patterns_at_stop = self._build_patterns_at_stop(patterns)
-        transfers_by_stop = self._build_transfers()
-        trip_service = dict(
-            zip(
-                self._data.trips["trip_id"].to_list(),
-                self._data.trips["service_id"].to_list(),
-            )
+    transfers compte les correspondances PHYSIQUES : un changement de
+    trip_id, pas un changement de segment de route GTFS. Rester sur le
+    même trip_id d'un segment au suivant (trips consécutifs d'un même
+    service découpés en tronçons) n'incrémente pas ce compteur.
+
+    visited_stops est un cache du chemin parcouru pour éviter de remonter
+    toute la chaîne parent à chaque contrôle de redondance.
+    """
+    arrival: int
+    walk_seconds: int
+    transfers: int
+    stop_idx: int
+    trip_id: str | None        # None si ce label vient d'un leg à pied ou est l'origine
+    route_idx: int | None      # index de route (pattern) emprunté pour atteindre ce label
+    from_stop: int | None      # stop_idx de départ du leg (None si origine)
+    departure_time: int | None # heure de départ du leg (None si origine)
+    parent: "Label | None"     # label précédent dans la chaîne (None si origine)
+    visited_stops: frozenset[int] = frozenset()
+
+
+# =====================================================================
+# Détection de trajectoire redondante — isolée du Pareto multicritère
+# =====================================================================
+
+def visits_stop(label: Label, stop_idx: int) -> bool:
+    """Vérifie rapidement si un arrêt a déjà été traversé sur ce chemin.
+
+    Le cache `visited_stops` évite la remontée coûteuse dans `parent`,
+    sans changer la sémantique du test de redondance utilisée pour
+    éliminer les trajets rétrogrades sur un même service GTFS.
+    """
+    return stop_idx in label.visited_stops
+
+
+# =====================================================================
+# Dominance Pareto — isolée pour ajuster facilement les critères
+# =====================================================================
+
+def dominates(a: Label, b: Label) -> bool:
+    """Vrai si le label a domine le label b : au moins aussi bon sur
+    tous les critères, strictement meilleur sur au moins un.
+
+    Pour ajouter un critère, ajouter la comparaison ici uniquement —
+    add_label() n'a pas à changer.
+    """
+    at_least_as_good = (
+        a.arrival <= b.arrival
+        and a.transfers <= b.transfers
+        and a.walk_seconds <= b.walk_seconds
+    )
+    strictly_better = (
+        a.arrival < b.arrival
+        or a.transfers < b.transfers
+        or a.walk_seconds < b.walk_seconds
+    )
+    return at_least_as_good and strictly_better
+
+
+def same_label(a: Label, b: Label) -> bool:
+    """Vrai si deux labels décrivent exactement la même solution semantique.
+
+    On ignore `parent` et `visited_stops` car ce sont des détails
+    d'implémentation du chemin ; le candidat reste identique si son
+    état final et sa trajectoire embarquée sont les mêmes.
+    """
+    return (
+        a.arrival == b.arrival
+        and a.walk_seconds == b.walk_seconds
+        and a.transfers == b.transfers
+        and a.stop_idx == b.stop_idx
+        and a.trip_id == b.trip_id
+        and a.route_idx == b.route_idx
+        and a.from_stop == b.from_stop
+        and a.departure_time == b.departure_time
+    )
+
+
+def add_label(bag: list[Label], candidate: Label, max_size: int = MAX_LABELS_PER_STOP) -> bool:
+    """Insère candidate dans bag en maintenant le front de Pareto.
+
+    Retourne True si candidate a été retenu (l'arrêt doit alors être
+    marqué pour exploration au round suivant). Retire de bag tout label
+    dominé par candidate ; rejette candidate s'il est lui-même dominé.
+    Si bag dépasse max_size, garde les labels arrivant le plus tôt.
+    """
+    for existing in bag:
+        if same_label(existing, candidate):
+            return False
+        if dominates(existing, candidate):
+            return False
+
+    bag[:] = [existing for existing in bag if not dominates(candidate, existing)]
+    bag.append(candidate)
+
+    if len(bag) > max_size:
+        bag.sort(key=lambda label: label.arrival)
+        del bag[max_size:]
+
+    return True
+
+
+# =====================================================================
+# 1. PRÉTRAITEMENT GTFS (exécuté 1 seule fois au démarrage)
+# =====================================================================
+
+_timetable: Timetable | None = None
+
+def get_timetable() -> Timetable:
+    global _timetable
+    if _timetable is None:
+        _timetable = build_timetable()
+    return _timetable
+
+
+def reload_timetable() -> None:
+    global _timetable
+    _timetable = build_timetable()
+
+def build_timetable() -> Timetable:
+    """Transforme les DataFrames GTFS bruts en tableaux RAPTOR indexés par entiers."""
+
+    data = GTFSDataStore.get()
+    stops_df = data.stops
+    stop_times_df = data.stop_times
+    trips_df = data.trips
+    transfers_df = data.transfers
+
+    # 1. Mapping continu des arrêts : stop_id -> int
+    all_stop_ids = sorted(stops_df["stop_id"].unique().to_list())
+    stop_to_idx = {sid: i for i, sid in enumerate(all_stop_ids)}
+    n_stops = len(all_stop_ids)
+
+    # 2. Joindre trips et stop_times pour avoir le service_id
+    st = stop_times_df.join(trips_df.select(["trip_id", "service_id"]), on="trip_id")
+    st = st.sort(["trip_id", "stop_sequence"])
+
+    # 3. Agrégation Polars (rapide en RAM et vectorisée en Rust)
+    grouped = st.group_by("trip_id", maintain_order=True).agg([
+        pl.col("service_id").first(),
+        pl.col("stop_id"),
+        pl.col("arrival_time"),
+        pl.col("departure_time"),
+    ])
+
+    # 4. Regroupement par "Pattern" (séquence unique d'arrêts)
+    pattern_trips = defaultdict(list)
+    for row in grouped.iter_rows(named=True):
+        stop_seq = tuple(stop_to_idx[sid] for sid in row["stop_id"])
+        pattern_trips[stop_seq].append({
+            "trip_id": row["trip_id"],
+            "service_id": row["service_id"],
+            "dep": row["departure_time"],
+            "arr": row["arrival_time"],
+        })
+
+    routes_stops: list[list[int]] = []
+    routes_trips: list[list[dict]] = []
+    routes_at_stop: list[list[tuple[int, int]]] = [[] for _ in range(n_stops)]
+
+    for r_idx, (stop_seq, trips) in enumerate(pattern_trips.items()):
+        # Tri des trips par heure de départ au premier arrêt
+        trips.sort(key=lambda t: t["dep"][0])
+        routes_stops.append(list(stop_seq))
+        routes_trips.append(trips)
+        for pos, s_idx in enumerate(stop_seq):
+            routes_at_stop[s_idx].append((r_idx, pos))
+
+    # 5. Correspondances & liaisons parent_station
+    transfers: list[list[tuple[int, int]]] = [[] for _ in range(n_stops)]
+    if transfers_df is not None:
+        for r in transfers_df.iter_rows(named=True):
+            if r["from_stop_id"] in stop_to_idx and r["to_stop_id"] in stop_to_idx:
+                u, v = stop_to_idx[r["from_stop_id"]], stop_to_idx[r["to_stop_id"]]
+                transfers[u].append((v, r.get("min_transfer_time") or 0))
+
+    if "parent_stop_id" in stops_df.columns:
+        for r in stops_df.iter_rows(named=True):
+            p = r["parent_stop_id"]
+            if p and p in stop_to_idx and r["stop_id"] in stop_to_idx:
+                u, v = stop_to_idx[r["stop_id"]], stop_to_idx[p]
+                transfers[u].append((v, 0))
+                transfers[v].append((u, 0))
+
+    return Timetable(
+        stops=all_stop_ids,
+        stop_to_idx=stop_to_idx,
+        routes_stops=routes_stops,
+        routes_trips=routes_trips,
+        routes_at_stop=routes_at_stop,
+        transfers=transfers,
+    )
+
+
+# =====================================================================
+# 2. FILTRAGE CALENDRIER (rapide, fait à la requête)
+# =====================================================================
+
+def get_active_services(travel_date: date) -> set[str]:
+    data = GTFSDataStore.get()
+    calendars_df = data.calendars
+    calendar_dates_df = data.calendar_dates
+    col = WEEKDAYS[travel_date.weekday()]
+    base = calendars_df.filter(
+        pl.col(col) & (pl.col("start_date") <= travel_date) & (pl.col("end_date") >= travel_date)
+    )["service_id"].to_list()
+    active = set(base)
+
+    exceptions = calendar_dates_df.filter(pl.col("date") == travel_date)
+    for row in exceptions.iter_rows(named=True):
+        if row["exception_type"] == 1:
+            active.add(row["service_id"])
+        elif row["exception_type"] == 2:
+            active.discard(row["service_id"])
+    return active
+
+
+# =====================================================================
+# 3. L'ALGORITHME McRAPTOR
+# =====================================================================
+
+def raptor_search(
+    origin_id: str,
+    dest_id: str,
+    dep_time: int,
+    active_services: set[str],
+    max_rounds: int,
+    max_results: int,
+) -> list[Journey]:
+    """Recherche multicritère : renvoie tous les trajets Pareto-optimaux
+    (arbitrage arrivée / correspondances physiques / marche à pied),
+    triés par heure d'arrivée croissante, jusqu'à max_results.
+
+    Le round k borne uniquement le nombre de tours d'exploration RAPTOR
+    (donc un plafond sur les correspondances possibles) ; les bags sont
+    indexés par arrêt seul, pas par (round, arrêt), pour que Pareto
+    compare des labels de "profondeur" d'exploration différente — ce qui
+    élimine les faux changements créés par des trips GTFS découpés en
+    plusieurs tronçons consécutifs d'un même service.
+    """
+    tt = get_timetable()
+    if origin_id not in tt.stop_to_idx or dest_id not in tt.stop_to_idx:
+        logger.warning("Origin or destination stop not found in the timetable.")
+        return []
+
+    src = tt.stop_to_idx[origin_id]
+    dst = tt.stop_to_idx[dest_id]
+    n_stops = len(tt.stops)
+
+    # bags[stop] : liste de Label Pareto-optimaux, tous rounds confondus
+    bags: list[list[Label]] = [[] for _ in range(n_stops)]
+
+    origin_label = Label(
+        arrival=dep_time,
+        walk_seconds=0,
+        transfers=0,
+        stop_idx=src,
+        trip_id=None,
+        route_idx=None,
+        from_stop=None,
+        departure_time=None,
+        parent=None,
+        visited_stops=frozenset({src}),
+    )
+    bags[src] = [origin_label]
+    marked = {src}
+
+    # Transferts initiaux à pied depuis le départ
+    for neighbor, duration in tt.transfers[src]:
+        arr = dep_time + duration
+        candidate = Label(
+            arrival=arr,
+            walk_seconds=duration,
+            transfers=0,
+            stop_idx=neighbor,
+            trip_id=None,
+            route_idx=None,
+            from_stop=src,
+            departure_time=dep_time,
+            parent=origin_label,
+            visited_stops=frozenset({src, neighbor}),
         )
-        return RaptorModel(
-            patterns=patterns,
-            patterns_at_stop=patterns_at_stop,
-            transfers_by_stop=transfers_by_stop,
-            trip_service=trip_service,
-            calendars=self._data.calendars,
-            calendar_dates=self._data.calendar_dates,
-        )
+        if add_label(bags[neighbor], candidate):
+            marked.add(neighbor)
 
-    def _build_patterns(self) -> list[Pattern]:
-        stop_times = self._data.stop_times.sort(["trip_id", "stop_sequence"])
+    route_active_trips = {
+        r_idx: [trip for trip in tt.routes_trips[r_idx] if trip["service_id"] in active_services]
+        for r_idx in range(len(tt.routes_trips))
+    }
 
-        rows_by_trip: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
-        for trip_id, stop_id, arrival, departure in zip(
-            stop_times["trip_id"].to_list(),
-            stop_times["stop_id"].to_list(),
-            stop_times["arrival_time"].to_list(),
-            stop_times["departure_time"].to_list(),
-        ):
-            rows_by_trip[trip_id].append((stop_id, arrival, departure))
+    for _round in range(1, max_rounds + 1):
+        if not marked:
+            break
 
-        trips_by_stop_sequence: dict[tuple[str, ...], list[PatternTrip]] = defaultdict(list)
-        for trip_id, rows in rows_by_trip.items():
-            stop_sequence = tuple(row[0] for row in rows)
-            trips_by_stop_sequence[stop_sequence].append(
-                PatternTrip(
-                    trip_id=trip_id,
-                    arrivals=tuple(row[1] for row in rows),
-                    departures=tuple(row[2] for row in rows),
-                )
-            )
+        # A. Accumulation des routes à explorer, avec les labels marqués
+        # présents à chaque arrêt (pas juste la position la plus en amont).
+        routes_to_scan: dict[int, list[tuple[int, Label]]] = defaultdict(list)
+        for s in marked:
+            for r_idx, pos in tt.routes_at_stop[s]:
+                for label in bags[s]:
+                    routes_to_scan[r_idx].append((pos, label))
 
-        patterns = []
-        for pattern_id, (stop_sequence, trips) in enumerate(trips_by_stop_sequence.items()):
-            trips.sort(key=lambda trip: trip.departures[0])
-            patterns.append(Pattern(pattern_id, stop_sequence, tuple(trips)))
-        return patterns
+        marked.clear()
+        newly_marked: set[int] = set()
 
-    @staticmethod
-    def _build_patterns_at_stop(patterns: list[Pattern]) -> dict[str, list[tuple[int, int]]]:
-        patterns_at_stop: dict[str, list[tuple[int, int]]] = defaultdict(list)
-        for pattern in patterns:
-            for stop_index, stop_id in enumerate(pattern.stop_ids):
-                patterns_at_stop[stop_id].append((pattern.pattern_id, stop_index))
-        return patterns_at_stop
+        # B. Parcours des routes
+        for r_idx, entries in routes_to_scan.items():
+            stops = tt.routes_stops[r_idx]
+            trips = route_active_trips.get(r_idx)
+            if not trips:
+                continue
 
-    def _build_transfers(self) -> dict[str, list[tuple[str, int]]]:
-        transfers = self._data.transfers
-        transfers_by_stop: dict[str, list[tuple[str, int]]] = defaultdict(list)
-        for from_stop, to_stop, min_time in zip(
-            transfers["from_stop_id"].to_list(),
-            transfers["to_stop_id"].to_list(),
-            transfers["min_transfer_time"].to_list(),
-        ):
-            transfers_by_stop[from_stop].append((to_stop, min_time or 0))
+            # Un embarquement possible par label marqué présent sur la route,
+            # trié par position pour parcourir le pattern dans l'ordre.
+            pending_boardings = sorted(entries, key=lambda e: e[0])
+            start_pos = pending_boardings[0][0]
 
-        # Implicit free transfer between a station and each of its child platforms (both ways),
-        # so a name resolved to the parent station can board from any of its platforms.
-        for stop_id, parent_id in zip(
-            self._data.stops["stop_id"].to_list(),
-            self._data.stops["parent_stop_id"].to_list(),
-        ):
-            if parent_id:
-                transfers_by_stop[parent_id].append((stop_id, 0))
-                transfers_by_stop[stop_id].append((parent_id, 0))
-        return transfers_by_stop
+            # boardings : embarquements actifs, liste de (trip, board_pos, boarding_label)
+            boardings: list[tuple[dict, int, Label]] = []
+            boarding_idx = 0
 
+            for pos in range(start_pos, len(stops)):
+                s = stops[pos]
 
-class RaptorModel:
-    """Static timetable plus the RAPTOR round-based search."""
-
-    _instance: RaptorModel | None = None
-    _lock = Lock()
-
-    def __init__(
-        self,
-        patterns: list[Pattern],
-        patterns_at_stop: dict[str, list[tuple[int, int]]],
-        transfers_by_stop: dict[str, list[tuple[str, int]]],
-        trip_service: dict[str, str],
-        calendars: pl.DataFrame,
-        calendar_dates: pl.DataFrame,
-    ) -> None:
-        self.patterns = patterns
-        self.patterns_at_stop = patterns_at_stop
-        self.transfers_by_stop = transfers_by_stop
-        self.trip_service = trip_service
-        self._calendars = calendars
-        self._calendar_dates = calendar_dates
-        self._trip_lookup: dict[str, PatternTrip] = {}
-        self._trip_pattern_stops: dict[str, tuple[str, ...]] = {}
-        for pattern in patterns:
-            for trip in pattern.trips:
-                self._trip_lookup[trip.trip_id] = trip
-                self._trip_pattern_stops[trip.trip_id] = pattern.stop_ids
-
-    @classmethod
-    def get(cls) -> RaptorModel:
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = RaptorModelBuilder().build()
-        return cls._instance
-
-    @classmethod
-    def reload(cls) -> RaptorModel:
-        new_model = RaptorModelBuilder().build()
-        with cls._lock:
-            cls._instance = new_model
-        return new_model
-
-    def _active_service_ids(self, travel_date: date) -> set[str]:
-        weekday_column = _WEEKDAYS[travel_date.weekday()]
-        base_services = self._calendars.filter(
-            pl.col(weekday_column)
-            & (pl.col("start_date") <= travel_date)
-            & (pl.col("end_date") >= travel_date)
-        )["service_id"].to_list()
-        active_services = set(base_services)
-
-        exceptions = self._calendar_dates.filter(pl.col("date") == travel_date)
-        for service_id, exception_type in zip(
-            exceptions["service_id"].to_list(),
-            exceptions["exception_type"].to_list(),
-        ):
-            if exception_type == 1:
-                active_services.add(service_id)
-            elif exception_type == 2:
-                active_services.discard(service_id)
-        return active_services
-
-    def _active_trip_ids(self, travel_date: date) -> set[str]:
-        active_services = self._active_service_ids(travel_date)
-        return {
-            trip_id
-            for trip_id, service_id in self.trip_service.items()
-            if service_id in active_services
-        }
-
-    def run(
-        self,
-        origin_stop_id: str,
-        destination_stop_id: str,
-        departure_time: int,
-        travel_date: date,
-        max_transfers: int = 5,
-        max_results: int = 5,
-    ) -> list[Journey]:
-        """Return up to `max_results` journeys, fastest first, using at most `max_transfers` correspondances."""
-        active_trip_ids = self._active_trip_ids(travel_date)
-        # Cache per-pattern filtered/sorted trips and their departure columns, reused across rounds.
-        pattern_trips_cache: dict[int, list[PatternTrip]] = {}
-        departures_cache: dict[int, list[list[int]]] = {}
-
-        best_arrival: dict[str, float] = defaultdict(lambda: INF)
-        best_arrival[origin_stop_id] = departure_time
-        parents: dict[str, tuple] = {}
-        prev_round_arrival: dict[str, float] = {origin_stop_id: departure_time}
-        marked_stops = {origin_stop_id}
-
-        # One journey per number of correspondances actually used, in increasing order
-        # (arrival time only improves as more rounds/correspondances are allowed).
-        journeys: list[Journey] = []
-
-        def snapshot_destination() -> None:
-            if destination_stop_id not in marked_stops:
-                return
-            arrival = best_arrival[destination_stop_id]
-            if arrival < INF and (not journeys or arrival < journeys[-1].arrival_time):
-                journeys.append(
-                    Journey(
-                        arrival_time=int(arrival),
-                        legs=tuple(self._reconstruct_legs(destination_stop_id, parents)),
+                # 1. Évaluer l'arrivée pour chaque embarquement actif
+                for trip, board_pos, boarding_label in boardings:
+                    arr = trip["arr"][pos]
+                    # Correspondance physique seulement si on change de trip_id
+                    # par rapport au dernier leg en trajet (pas de marche) du label.
+                    is_new_transfer = (
+                        boarding_label.trip_id is not None
+                        and boarding_label.trip_id != trip["trip_id"]
                     )
-                )
+                    candidate = Label(
+                        arrival=arr,
+                        walk_seconds=boarding_label.walk_seconds,
+                        transfers=boarding_label.transfers + (1 if is_new_transfer else 0),
+                        stop_idx=s,
+                        trip_id=trip["trip_id"],
+                        route_idx=r_idx,
+                        from_stop=stops[board_pos],
+                        departure_time=trip["dep"][board_pos],
+                        parent=boarding_label,
+                        visited_stops=boarding_label.visited_stops | {s},
+                    )
+                    if add_label(bags[s], candidate):
+                        newly_marked.add(s)
 
-        # A parent station has no stop_times of its own; reach its platforms once, up front.
-        for to_stop_id, min_transfer_time in self.transfers_by_stop.get(origin_stop_id, []):
-            arrival = departure_time + min_transfer_time
-            if arrival < best_arrival[to_stop_id]:
-                best_arrival[to_stop_id] = arrival
-                prev_round_arrival[to_stop_id] = arrival
-                parents[to_stop_id] = ("transfer", origin_stop_id, to_stop_id)
-                marked_stops.add(to_stop_id)
-        snapshot_destination()
+                # 2. Chercher un embarquement pour chaque label marqué à cette position
+                while boarding_idx < len(pending_boardings) and pending_boardings[boarding_idx][0] == pos:
+                    _, prev_label = pending_boardings[boarding_idx]
+                    boarding_idx += 1
 
-        for _ in range(max_transfers + 1):
-            if not marked_stops:
-                break
-
-            queue: dict[int, int] = {}
-            for stop_id in marked_stops:
-                for pattern_id, stop_index in self.patterns_at_stop.get(stop_id, []):
-                    if pattern_id not in queue or stop_index < queue[pattern_id]:
-                        queue[pattern_id] = stop_index
-
-            round_arrival = dict(prev_round_arrival)
-            next_marked: set[str] = set()
-
-            for pattern_id, start_index in queue.items():
-                pattern = self.patterns[pattern_id]
-                trips = pattern_trips_cache.get(pattern_id)
-                if trips is None:
-                    trips = [trip for trip in pattern.trips if trip.trip_id in active_trip_ids]
-                    pattern_trips_cache[pattern_id] = trips
-                    departures_cache[pattern_id] = [
-                        [trip.departures[i] for trip in trips] for i in range(len(pattern.stop_ids))
-                    ]
-                if not trips:
-                    continue
-                departures_by_index = departures_cache[pattern_id]
-
-                boarded_trip_index: int | None = None
-                boarded_at_index: int | None = None
-
-                for stop_index in range(start_index, len(pattern.stop_ids)):
-                    stop_id = pattern.stop_ids[stop_index]
-
-                    if boarded_trip_index is not None:
-                        trip = trips[boarded_trip_index]
-                        arrival = trip.arrivals[stop_index]
-                        if arrival < best_arrival[stop_id] and arrival < round_arrival.get(stop_id, INF):
-                            round_arrival[stop_id] = arrival
-                            best_arrival[stop_id] = arrival
-                            parents[stop_id] = (
-                                "trip",
-                                trip.trip_id,
-                                pattern.stop_ids[boarded_at_index],
-                                boarded_at_index,
-                                stop_index,
-                            )
-                            next_marked.add(stop_id)
-
-                    # Board the earliest trip we can still catch given last round's arrival here.
-                    earliest_reach = prev_round_arrival.get(stop_id, INF)
-                    if earliest_reach < INF:
-                        candidate_index = bisect.bisect_left(
-                            departures_by_index[stop_index], earliest_reach
+                    boarding_time = prev_label.arrival
+                    if prev_label.trip_id is not None:
+                        # Un vrai changement de véhicule impose un délai minimal ;
+                        # rester sur le même trip_id (tronçon suivant) n'en a pas besoin.
+                        boarding_time += MIN_TRANSFER_SECONDS
+                    deps = [t["dep"][pos] for t in trips]
+                    idx = bisect.bisect_left(deps, boarding_time)
+                    if idx < len(trips):
+                        candidate_trip = trips[idx]
+                        already_boarded = any(
+                            t is candidate_trip and b.walk_seconds <= prev_label.walk_seconds
+                            and b.transfers <= prev_label.transfers
+                            for t, _, b in boardings
                         )
-                        if candidate_index < len(trips) and (
-                            boarded_trip_index is None or candidate_index < boarded_trip_index
-                        ):
-                            boarded_trip_index = candidate_index
-                            boarded_at_index = stop_index
+                        # Rejette un embarquement dont le trajet repasserait par
+                        # des arrêts déjà traversés par prev_label : signe d'une
+                        # trajectoire redondante (même service GTFS découpé en
+                        # plusieurs trip_id consécutifs), pas d'une vraie correspondance.
+                        stop_seq = tt.routes_stops[r_idx]
+                        retraces_path = any(
+                            stop_idx in prev_label.visited_stops
+                            for stop_idx in stop_seq[pos + 1:]
+                        )
+                        # Rejette un ré-embarquement sur la MÊME route (r_idx)
+                        # que celle dont prev_label vient justement de descendre
+                        # à cet arrêt : descendre puis remonter sur un passage
+                        # suivant de la même ligne n'est jamais utile, rester à
+                        # bord du premier passage est toujours au moins aussi
+                        # bon (même trajet restant, zéro correspondance en plus).
+                        same_route_reboarding = (
+                            prev_label.route_idx == r_idx
+                            and prev_label.stop_idx == s
+                        )
+                        if not already_boarded and not retraces_path and not same_route_reboarding:
+                            boardings.append((candidate_trip, pos, prev_label))
 
-            for stop_id in list(next_marked):
-                arrival_here = round_arrival[stop_id]
-                for to_stop_id, min_transfer_time in self.transfers_by_stop.get(stop_id, []):
-                    arrival = arrival_here + min_transfer_time
-                    if arrival < best_arrival[to_stop_id]:
-                        best_arrival[to_stop_id] = arrival
-                        round_arrival[to_stop_id] = arrival
-                        parents[to_stop_id] = ("transfer", stop_id, to_stop_id)
-                        next_marked.add(to_stop_id)
-
-            prev_round_arrival = round_arrival
-            marked_stops = next_marked
-            snapshot_destination()
-
-        journeys.sort(key=lambda journey: journey.arrival_time)
-        return journeys[:max_results]
-
-    def _reconstruct_legs(self, destination_stop_id: str, parents: dict[str, tuple]) -> list[Leg]:
-        legs: list[Leg] = []
-        stop_id = destination_stop_id
-        while stop_id in parents:
-            entry = parents[stop_id]
-            if entry[0] == "trip":
-                _, trip_id, from_stop, boarded_at_index, arrival_index = entry
-                trip = self._trip_lookup[trip_id]
-                stop_sequence = self._trip_pattern_stops[trip_id]
-                ride_stops = tuple(
-                    RideStop(stop_sequence[i], trip.arrivals[i], trip.departures[i])
-                    for i in range(boarded_at_index, arrival_index + 1)
-                )
-                legs.append(
-                    Leg(
-                        from_stop=from_stop,
-                        to_stop=stop_id,
-                        departure_time=trip.departures[boarded_at_index],
-                        arrival_time=trip.arrivals[arrival_index],
-                        trip_id=trip_id,
-                        stops=ride_stops,
-                    )
-                )
-                stop_id = from_stop
-            else:
-                _, from_stop, to_stop = entry
-                legs.append(
-                    Leg(
-                        from_stop=from_stop,
-                        to_stop=to_stop,
-                        departure_time=None,
-                        arrival_time=None,
+        # C. Transferts à pied, à partir des labels nouvellement ajoutés ce round
+        for s in list(newly_marked):
+            for label in list(bags[s]):
+                for neighbor, duration in tt.transfers[s]:
+                    arr_neighbor = label.arrival + duration
+                    walk_neighbor = label.walk_seconds + duration
+                    candidate = Label(
+                        arrival=arr_neighbor,
+                        walk_seconds=walk_neighbor,
+                        transfers=label.transfers,
+                        stop_idx=neighbor,
                         trip_id=None,
+                        route_idx=None,
+                        from_stop=s,
+                        departure_time=label.arrival,
+                        parent=label,
+                        visited_stops=label.visited_stops | {neighbor},
                     )
-                )
-                stop_id = from_stop
+                    if add_label(bags[neighbor], candidate):
+                        newly_marked.add(neighbor)
+
+        marked = newly_marked
+
+    # 4. Reconstruction de tous les trajets Pareto-optimaux à destination
+    all_dest_labels = bags[dst]
+
+    if not all_dest_labels:
+        logger.warning("No route found from %s to %s", src, dst)
+        return []
+
+    journeys: list[Journey] = []
+
+    for label in all_dest_labels:
+        legs: list[JourneyLeg] = []
+        cursor = label
+
+        while cursor.parent is not None:
+            legs.append(JourneyLeg(
+                trip_id=cursor.trip_id,
+                from_stop=tt.stops[cursor.from_stop],
+                to_stop=tt.stops[cursor.stop_idx],
+                departure_time=cursor.departure_time,
+                arrival_time=cursor.arrival,
+            ))
+            cursor = cursor.parent
+
+        if not legs:
+            continue
+
         legs.reverse()
-        return legs
+        depart_time = next((leg.departure_time for leg in legs if leg.trip_id is not None), dep_time)
+
+        journeys.append(Journey(
+            departure_time=depart_time,
+            arrival_time=int(label.arrival),
+            duration_minutes=round((int(label.arrival) - depart_time) / 60),
+            walk_seconds=label.walk_seconds,
+            transfers=label.transfers,
+            legs=legs,
+        ))
+
+    journeys.sort(key=lambda j: j.arrival_time)
+    journeys = journeys[:max_results]
+
+    logger.info("Found %s Pareto-optimal journeys from %s to %s", len(journeys), src, dst)
+    return journeys

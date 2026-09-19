@@ -9,53 +9,46 @@ from django.db import connection
 class GTFSDataStore:
     _instance: GTFSDataStore | None = None
     _lock = Lock()
-
-    def __init__(self) -> None:
-        self.stops = self._load_table(
-            """
+    _table_queries = {
+        "stops": """
             SELECT stop_id, stop_name, location_type, parent_stop_id
             FROM gtfs_stops
-            """
-        )
-        self.routes = self._load_table(
-            """
+            """,
+        "routes": """
             SELECT route_id, route_long_name, route_type, route_type_name, route_color
             FROM gtfs_routes
-            """
-        )
-        self.trips = self._load_table(
-            """
+            """,
+        "trips": """
             SELECT trip_id, route_id, service_id, trip_headsign, direction_id
             FROM gtfs_trips
-            """
-        )
-        self.stop_times = self._load_table(
-            """
+            """,
+        "stop_times": """
             SELECT trip_id, stop_id, arrival_time, departure_time, stop_sequence
             FROM gtfs_stop_times
-            """
-        )
-
-        self.transfers = self._load_table(
-            """
+            """,
+        "transfers": """
             SELECT from_stop_id, to_stop_id, min_transfer_time
             FROM gtfs_transfers
-            """
-        )
-
-        self.calendars = self._load_table(
-            """
+            """,
+        "calendars": """
             SELECT service_id, monday, tuesday, wednesday, thursday, friday, saturday, sunday, start_date, end_date
             FROM gtfs_calendar
-            """
-        )
-
-        self.calendar_dates = self._load_table(
-            """
+            """,
+        "calendar_dates": """
             SELECT service_id, date, exception_type
             FROM gtfs_calendar_dates
-            """
-        )
+            """,
+    }
+
+    def __init__(self) -> None:
+        self._tables: dict[str, pl.DataFrame] = {}
+
+    def __getattr__(self, name: str) -> pl.DataFrame:
+        if name in self._table_queries:
+            if name not in self._tables:
+                self._tables[name] = self._load_table(self._table_queries[name])
+            return self._tables[name]
+        raise AttributeError(f"GTFSDataStore has no attribute '{name}'")
 
     @staticmethod
     def _load_table(query: str) -> pl.DataFrame:

@@ -128,14 +128,12 @@ def get_stop_detail(stop_id: str) -> dict:
         .join(data.routes.lazy(), on="route_id")
         .select([
             pl.col("route_id"),
-            pl.col("route_short_name"),
             pl.col("route_long_name"),
             pl.col("route_type"),
             pl.col("route_type_name"),
             pl.col("route_color"),
         ])
         .unique()
-        .sort("route_short_name")
         .collect()
         .to_dicts()
     )
@@ -144,9 +142,7 @@ def get_stop_detail(stop_id: str) -> dict:
         "stop": stop,
         "child_stops": child_stops.select([
             pl.col("stop_id").alias("child_stop_id"),
-            pl.col("stop_name").alias("child_stop_name"),
-            pl.col("stop_lat").alias("child_stop_lat"),
-            pl.col("stop_lon").alias("child_stop_lon"),
+            pl.col("stop_name").alias("child_stop_name")
         ]).to_dicts(),
         "routes": routes,
     }
@@ -168,8 +164,6 @@ def get_route_stops(route_id: str) -> dict:
         .select([
             pl.col("stop_id"),
             pl.col("stop_name"),
-            pl.col("stop_lat"),
-            pl.col("stop_lon"),
             pl.col("location_type"),
             pl.col("parent_stop_id"),
         ])

@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 import polars as pl
 
 from apps.network.dataset import GTFSDataStore
-from apps.routing.raptor.model import Journey, Leg, RaptorModel
+from apps.routing.raptor.model import Journey, JourneyLeg, raptor_search, get_active_services
 
 
 def _seconds_to_datetime(travel_date: date, seconds: int | None) -> str | None:
@@ -20,7 +20,6 @@ def _collect_stop_ids(journey: Journey) -> set[str]:
     for leg in journey.legs:
         stop_ids.add(leg.from_stop)
         stop_ids.add(leg.to_stop)
-        stop_ids.update(ride_stop.stop_id for ride_stop in leg.stops)
     return stop_ids
 
 
@@ -89,7 +88,7 @@ def _ride_stop_payload(ride_stop, stop_lookup: dict[str, dict], travel_date: dat
 
 
 def _format_leg(
-    leg: Leg,
+    leg: JourneyLeg,
     stop_lookup: dict[str, dict],
     trip_lookup: dict[str, dict],
     travel_date: date,
@@ -102,7 +101,8 @@ def _format_leg(
             "type": "transfer",
             "from": from_payload,
             "to": to_payload,
-            "same_station": from_payload["station_id"] == to_payload["station_id"],
+            "same_parent_station": from_payload["station_id"] == to_payload["station_id"],
+            "minimum_transfer_time": round((leg.arrival_time - leg.departure_time)/60),
         }
 
     trip = trip_lookup.get(leg.trip_id, {})
@@ -119,7 +119,6 @@ def _format_leg(
         "departure_datetime": _seconds_to_datetime(travel_date, leg.departure_time),
         "arrival_time": leg.arrival_time,
         "arrival_datetime": _seconds_to_datetime(travel_date, leg.arrival_time),
-        "stops": [_ride_stop_payload(s, stop_lookup, travel_date) for s in leg.stops],
     }
 
 
@@ -130,9 +129,10 @@ def _format_journey(
     travel_date: date,
 ) -> dict:
     return {
-        "arrival_time": journey.arrival_time,
+        "departure_datetime": _seconds_to_datetime(travel_date, journey.departure_time),
         "arrival_datetime": _seconds_to_datetime(travel_date, journey.arrival_time),
-        "transfers": journey.transfer_count,
+        "duration_minutes": journey.duration_minutes,
+        "correspondence": sum(leg.trip_id is not None for leg in journey.legs),
         "legs": [_format_leg(leg, stop_lookup, trip_lookup, travel_date) for leg in journey.legs],
     }
 
@@ -142,13 +142,20 @@ def raptor_query(
     target_stop_id: str,
     departure_time: int,
     travel_date: date,
-    max_transfers: int = 5,
-    max_results: int = 5,
+    max_rounds: int,
+    max_results: int,
 ) -> dict:
     """Run RAPTOR between two stops and return up to `max_results` journeys, fastest first."""
-    model = RaptorModel.get()
-    journeys = model.run(
-        source_stop_id, target_stop_id, departure_time, travel_date, max_transfers, max_results
+
+    active_services = get_active_services(travel_date)
+
+    journeys = raptor_search(
+        source_stop_id,
+        target_stop_id,
+        departure_time,
+        active_services,
+        max_rounds,
+        max_results,
     )
 
     if not journeys:
@@ -160,12 +167,18 @@ def raptor_query(
     )
     trip_lookup = _build_trip_lookup(
         data,
-        {leg.trip_id for journey in journeys for leg in journey.legs if leg.trip_id is not None},
+        {
+            leg.trip_id
+            for journey in journeys
+            for leg in journey.legs
+            if leg.trip_id is not None
+        },
     )
 
     return {
         "found": True,
         "journeys": [
-            _format_journey(journey, stop_lookup, trip_lookup, travel_date) for journey in journeys
+            _format_journey(journey, stop_lookup, trip_lookup, travel_date)
+            for journey in journeys
         ],
     }
